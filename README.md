@@ -1,6 +1,6 @@
 # edgar-client
 
-Python client for the SEC Edgar API.
+A Python client for retrieving filings from the SEC Edgar.
 
 ## Examples
 

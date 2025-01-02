@@ -1,11 +1,30 @@
+[build-system]
+requires = ["hatchling", "hatch-fancy-pypi-readme"]
+build-backend = "hatchling.build"
+
 [project]
 name = "edgar-client"
 version = "0.1.0"
-description = "Add your description here"
+description = "A Python client for retrieving filings from the SEC Edgar."
+license = { file = "LICENSE" }
 readme = "README.md"
-requires-python = ">=3.12"
+authors = [
+    { name = "Joey Chilson", email = "joeychilson@outlook.com" },
+]
+requires-python = ">=3.9"
 dependencies = [
     "httpx>=0.28.1",
     "pydantic>=2.10.4",
     "ratelimit>=2.2.1",
 ]
+
+[dependency-groups]
+lint = [
+    "ruff>=0.8.4",
+]
+
+[tool.hatch.build.targets.sdist]
+include = ["edgar_client"]
+
+[tool.ruff]
+line-length = 120

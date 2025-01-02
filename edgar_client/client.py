@@ -1,10 +1,20 @@
+import logging
 from datetime import datetime
-from typing import Any, Dict, List, Optional
+from functools import lru_cache
+from typing import Any, Dict, Generator, List, Optional
 from urllib.parse import urljoin
 
-from httpx import Client, Response
+from httpx import Client, HTTPError, Response
 from pydantic import BaseModel
 from ratelimit import limits, sleep_and_retry
+
+logger = logging.getLogger(__name__)
+
+
+class EDGARError(Exception):
+    """Base exception for EDGAR-related errors."""
+
+    pass
 
 
 class FilerMatch(BaseModel):
@@ -38,6 +48,7 @@ class Filing(BaseModel):
     is_inline_xbrl: bool
     primary_document: str
     primary_document_description: str
+    primary_document_url: str
 
 
 class Filer(BaseModel):
@@ -66,9 +77,7 @@ class EDGARClient:
     BASE_URL = "https://www.sec.gov"
     DATA_URL = "https://data.sec.gov"
 
-    def __init__(
-        self, user_agent: str = "CompanyName contact@email.com", timeout: int = 30
-    ) -> None:
+    def __init__(self, user_agent: str = "CompanyName contact@email.com", timeout: int = 30) -> None:
         """
         Initialize the EDGAR client.
 
@@ -77,9 +86,11 @@ class EDGARClient:
             timeout: Request timeout in seconds
             rate_limit: Maximum requests per second
         """
+        if not user_agent or len(user_agent.split()) < 2:
+            raise ValueError("User agent must contain company name and contact email as per SEC requirements")
+
         self.user_agent = user_agent
         self.timeout = timeout
-
         self.client = Client(timeout=timeout, headers={"User-Agent": user_agent})
 
     def __enter__(self) -> "EDGARClient":
@@ -103,9 +114,12 @@ class EDGARClient:
         Raises:
             httpx.HTTPError: If the request fails
         """
-        response = self.client.get(url)
-        response.raise_for_status()
-        return response
+        try:
+            response = self.client.get(url)
+            response.raise_for_status()
+            return response
+        except HTTPError as e:
+            raise EDGARError(f"HTTP error occurred: {str(e)}") from e
 
     def search_filers(
         self,
@@ -124,33 +138,41 @@ class EDGARClient:
 
         Returns:
             List of matching filers
+
+        Raises:
+            EDGARError: If the request fails
         """
         url = urljoin(self.BASE_URL, "/Archives/edgar/cik-lookup-data.txt")
         response = self._get(url)
 
-        matches = []
-        for line in response.text.splitlines():
-            if not line.strip():
-                continue
+        normalized_ciks = {self._normalize_cik(cik) for cik in (ciks or [])}
 
-            fields = line.split(":")
-            if len(fields) < 3:
-                continue
+        def filer_generator() -> Generator[FilerMatch, None, None]:
+            for line in response.text.splitlines():
+                if not line.strip():
+                    continue
 
-            name = fields[0].strip()
-            cik = f"{int(fields[1]):010d}"
+                fields = line.split(":")
+                if len(fields) < 3:
+                    logger.warning(f"Skipping malformed line: {line}")
+                    continue
 
-            if ciks and cik not in ciks:
-                continue
-            if contains and contains.lower() not in name.lower():
-                continue
+                try:
+                    name = fields[0].strip()
+                    cik = self._normalize_cik(fields[1])
 
-            matches.append(FilerMatch(name=name, cik=cik))
+                    if normalized_ciks and cik not in normalized_ciks:
+                        continue
+                    if contains and contains.lower() not in name.lower():
+                        continue
 
-            if limit and len(matches) >= limit:
-                break
+                    yield FilerMatch(name=name, cik=cik)
+                except ValueError as e:
+                    logger.warning(f"Error processing line {line}: {str(e)}")
+                    continue
 
-        return matches
+        matches = list(filer_generator())
+        return matches[:limit] if limit else matches
 
     def search_companies(
         self,
@@ -165,47 +187,56 @@ class EDGARClient:
         Search for companies by various criteria.
 
         Args:
-            tickers: Filter by ticker symbols
+            tickers: Filter by ticker symbols (case-insensitive)
             ciks: Filter by CIK numbers
-            exchanges: Filter by exchange names
-            contains: Filter company names containing this string
+            exchanges: Filter by exchange names (case-insensitive)
+            contains: Filter company names containing this string (case-insensitive)
             limit: Maximum number of results to return
 
         Returns:
             List of matching companies
+
+        Raises:
+            EDGARError: If the request fails
         """
         url = urljoin(self.BASE_URL, "/files/company_tickers_exchange.json")
         response = self._get(url)
         data = response.json()
 
-        companies = []
-        for row in data["data"]:
-            if len(row) != 4:
-                continue
+        normalized_ciks = {self._normalize_cik(cik) for cik in (ciks or [])}
+        normalized_tickers = {t.upper() for t in (tickers or [])}
+        normalized_exchanges = {e.upper() for e in (exchanges or [])}
 
-            cik = f"{int(row[0]):010d}"
-            name = str(row[1])
-            ticker = str(row[2])
-            exchange = str(row[3])
+        def company_generator() -> Generator[CompanyMatch, None, None]:
+            for row in data.get("data", []):
+                try:
+                    if len(row) != 4:
+                        logger.warning(f"Skipping malformed company data: {row}")
+                        continue
 
-            if ciks and cik not in ciks:
-                continue
-            if tickers and ticker not in tickers:
-                continue
-            if exchanges and exchange not in exchanges:
-                continue
-            if contains and contains.lower() not in name.lower():
-                continue
+                    cik = self._normalize_cik(str(row[0]))
+                    name = str(row[1])
+                    ticker = str(row[2])
+                    exchange = str(row[3])
 
-            companies.append(
-                CompanyMatch(cik=cik, name=name, ticker=ticker, exchange_name=exchange)
-            )
+                    if normalized_ciks and cik not in normalized_ciks:
+                        continue
+                    if normalized_tickers and ticker.upper() not in normalized_tickers:
+                        continue
+                    if normalized_exchanges and exchange.upper() not in normalized_exchanges:
+                        continue
+                    if contains and contains.lower() not in name.lower():
+                        continue
 
-            if limit and len(companies) >= limit:
-                break
+                    yield CompanyMatch(cik=cik, name=name, ticker=ticker, exchange_name=exchange)
+                except (ValueError, IndexError) as e:
+                    logger.warning(f"Error processing company data {row}: {str(e)}")
+                    continue
 
-        return companies
+        companies = list(company_generator())
+        return companies[:limit] if limit else companies
 
+    @lru_cache(maxsize=100)
     def get_filer(self, cik: str) -> Filer:
         """
         Retrieve a filer's profile information.
@@ -215,29 +246,18 @@ class EDGARClient:
 
         Returns:
             Filer profile information
+
+        Raises:
+            EDGARError: If the request fails
+            ValueError: If CIK is invalid
         """
-        normalized_cik = f"{int(cik):010d}"
+        normalized_cik = self._normalize_cik(cik)
         url = urljoin(self.DATA_URL, f"submissions/CIK{normalized_cik}.json")
         response = self._get(url)
-        data = response.json()
-
-        return Filer(
-            cik=data["cik"],
-            entity_type=data["entityType"],
-            sic=data.get("sic"),
-            sic_description=data.get("sicDescription"),
-            name=data["name"],
-            tickers=data["tickers"],
-            exchanges=data["exchanges"],
-            ein=data.get("ein"),
-            description=data.get("description"),
-            website=data.get("website"),
-            category=data.get("category"),
-            fiscal_year_end=data.get("fiscalYearEnd"),
-            state_of_incorporation=data.get("stateOfIncorporation"),
-            phone_number=data.get("phone"),
-            flags=data.get("flags"),
-        )
+        try:
+            return Filer.model_validate(response.json())
+        except ValueError as e:
+            raise EDGARError(f"Invalid filer data received: {str(e)}") from e
 
     def get_filings(
         self,
@@ -255,55 +275,61 @@ class EDGARClient:
             cik: CIK number
             start_date: Start date for filtering filings
             end_date: End date for filtering filings
-            forms: Forms to filter by
+            forms: Forms to filter by (e.g., ["10-K", "10-Q"])
             limit: Maximum number of filings to return
 
         Returns:
             List of filings
+
+        Raises:
+            EDGARError: If the request fails
+            ValueError: If CIK is invalid
         """
-        normalized_cik = f"{int(cik):010d}"
+        normalized_cik = self._normalize_cik(cik)
         url = urljoin(self.DATA_URL, f"submissions/CIK{normalized_cik}.json")
         response = self._get(url)
         data = response.json()
 
-        all_filings = []
+        def filing_generator() -> Generator[Filing, None, None]:
+            seen_accession_numbers = set()
 
-        main_filings = self._parse_filings(data["filings"]["recent"])
-        all_filings.extend(main_filings)
+            for filing in self._parse_filings(cik, data["filings"]["recent"]):
+                if filing.accession_number not in seen_accession_numbers:
+                    seen_accession_numbers.add(filing.accession_number)
+                    if self._should_include_filing(filing, start_date, end_date, forms):
+                        yield filing
 
-        for file in data["filings"]["files"]:
-            file_url = urljoin(self.DATA_URL, f"submissions/{file['name']}")
-            file_response = self._get(file_url)
-            file_data = file_response.json()
+            for file in data["filings"].get("files", []):
+                try:
+                    file_url = urljoin(self.DATA_URL, f"submissions/{file['name']}")
+                    file_response = self._get(file_url)
+                    file_data = file_response.json()
 
-            additional_filings = self._parse_filings(file_data)
-            all_filings.extend(additional_filings)
+                    for filing in self._parse_filings(cik, file_data):
+                        if filing.accession_number not in seen_accession_numbers:
+                            seen_accession_numbers.add(filing.accession_number)
+                            if self._should_include_filing(filing, start_date, end_date, forms):
+                                yield filing
+                except Exception as e:
+                    logger.error(f"Error processing filing file {file['name']}: {str(e)}")
+                    continue
 
-        filtered_filings = []
-        for filing in all_filings:
-            if start_date and filing.filing_date < start_date:
-                continue
-            if end_date and filing.filing_date > end_date:
-                continue
-            if forms and filing.form not in forms:
-                continue
-            filtered_filings.append(filing)
+        filings = list(filing_generator())
+        return filings[:limit] if limit else filings
 
-            if limit and len(filtered_filings) >= limit:
-                break
-
-        return filtered_filings
-
-    def _parse_filings(self, data: Dict[str, Any]) -> List[Filing]:
-        """Parse filings data into Filing objects.
+    def _parse_filings(self, cik: str, data: Dict[str, Any]) -> Generator[Filing, None, None]:
+        """
+        Parse filings data into Filing objects.
 
         Args:
             data: Filings data
 
-        Returns:
-            List of filings
+        Yields:
+            Filing objects
         """
-        filings = []
+        if not data.get("accessionNumber"):
+            return
+
         num_filings = len(data["accessionNumber"])
 
         for i in range(num_filings):
@@ -317,42 +343,51 @@ class EDGARClient:
                         "%Y-%m-%dT%H:%M:%S%z",
                     ),
                     "size": data["size"][i],
-                    "is_xbrl": bool(data.get("isXBRL", [0] * num_filings)[i]),
-                    "is_inline_xbrl": bool(
-                        data.get("isInlineXBRL", [0] * num_filings)[i]
-                    ),
-                    "primary_document": data.get("primaryDocument", [""] * num_filings)[
-                        i
-                    ]
-                    or "",
-                    "primary_document_description": data.get(
-                        "primaryDocDescription", [""] * num_filings
-                    )[i]
-                    or "",
+                    "is_xbrl": bool(data["isXBRL"][i]),
+                    "is_inline_xbrl": bool(data["isInlineXBRL"][i]),
+                    "primary_document": data["primaryDocument"][i] or "",
+                    "primary_document_description": data["primaryDocDescription"][i] or "",
                 }
 
-                if (
-                    data.get("reportDate")
-                    and i < len(data["reportDate"])
-                    and data["reportDate"][i]
-                ):
-                    filing_dict["report_date"] = datetime.strptime(
-                        data["reportDate"][i], "%Y-%m-%d"
-                    )
+                if "reportDate" in data and i < len(data["reportDate"]) and data["reportDate"][i]:
+                    filing_dict["report_date"] = datetime.strptime(data["reportDate"][i], "%Y-%m-%d")
 
-                if data.get("act") and i < len(data["act"]) and data["act"][i]:
+                if "act" in data and i < len(data["act"]) and data["act"][i]:
                     filing_dict["act"] = data["act"][i]
 
-                if data.get("items") and i < len(data["items"]) and data["items"][i]:
-                    filing_dict["items"] = [
-                        item.strip()
-                        for item in data["items"][i].split(",")
-                        if item.strip()
-                    ]
+                if "items" in data and i < len(data["items"]) and data["items"][i]:
+                    filing_dict["items"] = [item.strip() for item in data["items"][i].split(",") if item.strip()]
 
-                filings.append(Filing.model_validate(filing_dict))
+                filing_dict["primary_document_url"] = urljoin(
+                    self.BASE_URL,
+                    f"/Archives/edgar/data/{cik}/{filing_dict['accession_number'].replace('-', '')}/{filing_dict['primary_document']}",
+                )
+
+                yield Filing.model_validate(filing_dict)
             except (KeyError, IndexError, ValueError) as e:
-                print(f"Warning: Error parsing filing {i}: {e}")
+                logger.warning(f"Error parsing filing {i}: {str(e)}")
                 continue
 
-        return filings
+    @staticmethod
+    def _normalize_cik(cik: str) -> str:
+        """Normalize CIK to 10-digit format."""
+        try:
+            return f"{int(cik):010d}"
+        except ValueError as e:
+            raise ValueError(f"Invalid CIK format: {cik}") from e
+
+    @staticmethod
+    def _should_include_filing(
+        filing: Filing,
+        start_date: Optional[datetime],
+        end_date: Optional[datetime],
+        forms: Optional[List[str]],
+    ) -> bool:
+        """Determine if a filing should be included based on filters."""
+        if start_date and filing.filing_date < start_date:
+            return False
+        if end_date and filing.filing_date > end_date:
+            return False
+        if forms and filing.form not in forms:
+            return False
+        return True
