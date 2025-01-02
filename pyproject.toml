@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "edgar-client"
-version = "0.0.1"
+version = "0.0.2"
 description = "A Python client for retrieving filings from the SEC Edgar."
 license = { file = "LICENSE" }
 readme = "README.md"
@@ -38,6 +38,7 @@ Issues = "https://github.com/joeychilson/edgar-client/issues"
 
 [dependency-groups]
 lint = [
+    "mypy>=1.14.1",
     "ruff>=0.8.4",
 ]
 

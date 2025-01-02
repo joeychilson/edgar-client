@@ -6,12 +6,12 @@ from urllib.parse import urljoin
 
 from httpx import Client, HTTPError, Response
 from pydantic import BaseModel
-from ratelimit import limits, sleep_and_retry
+from ratelimit import limits, sleep_and_retry  # type: ignore
 
 logger = logging.getLogger(__name__)
 
 
-class EDGARError(Exception):
+class EdgarError(Exception):
     """Base exception for EDGAR-related errors."""
 
     pass
@@ -71,7 +71,7 @@ class Filer(BaseModel):
     flags: Optional[str] = None
 
 
-class EDGARClient:
+class EdgarClient:
     """Client for interacting with SEC's EDGAR system."""
 
     BASE_URL = "https://www.sec.gov"
@@ -93,7 +93,7 @@ class EDGARClient:
         self.timeout = timeout
         self.client = Client(timeout=timeout, headers={"User-Agent": user_agent})
 
-    def __enter__(self) -> "EDGARClient":
+    def __enter__(self) -> "EdgarClient":
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb) -> None:
@@ -112,14 +112,14 @@ class EDGARClient:
             Response object
 
         Raises:
-            httpx.HTTPError: If the request fails
+            EdgarError: If the request fails
         """
         try:
             response = self.client.get(url)
             response.raise_for_status()
             return response
         except HTTPError as e:
-            raise EDGARError(f"HTTP error occurred: {str(e)}") from e
+            raise EdgarError(f"HTTP error occurred: {str(e)}") from e
 
     def search_filers(
         self,
@@ -140,7 +140,7 @@ class EDGARClient:
             List of matching filers
 
         Raises:
-            EDGARError: If the request fails
+            EdgarError: If the request fails
         """
         url = urljoin(self.BASE_URL, "/Archives/edgar/cik-lookup-data.txt")
         response = self._get(url)
@@ -197,7 +197,7 @@ class EDGARClient:
             List of matching companies
 
         Raises:
-            EDGARError: If the request fails
+            EdgarError: If the request fails
         """
         url = urljoin(self.BASE_URL, "/files/company_tickers_exchange.json")
         response = self._get(url)
@@ -248,7 +248,7 @@ class EDGARClient:
             Filer profile information
 
         Raises:
-            EDGARError: If the request fails
+            EdgarError: If the request fails
             ValueError: If CIK is invalid
         """
         normalized_cik = self._normalize_cik(cik)
@@ -257,7 +257,7 @@ class EDGARClient:
         try:
             return Filer.model_validate(response.json())
         except ValueError as e:
-            raise EDGARError(f"Invalid filer data received: {str(e)}") from e
+            raise EdgarError(f"Invalid filer data received: {str(e)}") from e
 
     def get_filings(
         self,
