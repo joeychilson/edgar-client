@@ -1,6 +1,7 @@
 import logging
 from datetime import datetime
 from functools import lru_cache
+import os
 from typing import Any, Dict, Generator, List, Optional
 from urllib.parse import urljoin
 
@@ -71,6 +72,23 @@ class Filer(BaseModel):
     flags: Optional[str] = None
 
 
+class DirectoryItem(BaseModel):
+    """Represents a single file in an EDGAR directory listing."""
+
+    name: str
+    type: str
+    size: str
+    last_modified: datetime
+
+
+class DirectoryListing(BaseModel):
+    """Represents an EDGAR directory listing."""
+
+    items: List[DirectoryItem]
+    name: str
+    parent_dir: str
+
+
 class EdgarClient:
     """Client for interacting with SEC's EDGAR system."""
 
@@ -91,7 +109,7 @@ class EdgarClient:
 
         self.user_agent = user_agent
         self.timeout = timeout
-        self.client = Client(timeout=timeout, headers={"User-Agent": user_agent})
+        self.client = Client(timeout=timeout, headers={"User-Agent": user_agent}, follow_redirects=True)
 
     def __enter__(self) -> "EdgarClient":
         return self
@@ -367,6 +385,113 @@ class EdgarClient:
             except (KeyError, IndexError, ValueError) as e:
                 logger.warning(f"Error parsing filing {i}: {str(e)}")
                 continue
+
+    def get_filing_directory(self, cik: str, accession_number: str) -> DirectoryListing:
+        """
+        Get the directory listing for a specific filing.
+
+        Args:
+            cik: The CIK number
+            accession_number: The accession number of the filing
+
+        Returns:
+            DirectoryListing object containing file information
+
+        Raises:
+            EdgarError: If the request fails
+        """
+        normalized_cik = self._normalize_cik(cik)
+        normalized_accession = accession_number.replace("-", "")
+        url = urljoin(self.BASE_URL, f"/Archives/edgar/data/{normalized_cik}/{normalized_accession}/index.json")
+
+        response = self.get(url)
+        data = response.json()
+
+        # Transform the data to match our model
+        items = []
+        for item in data["directory"]["item"]:
+            items.append(
+                DirectoryItem(
+                    name=item["name"],
+                    type=item["type"],
+                    size=item["size"],
+                    last_modified=datetime.strptime(item["last-modified"], "%Y-%m-%d %H:%M:%S"),
+                )
+            )
+
+        return DirectoryListing(items=items, name=data["directory"]["name"], parent_dir=data["directory"]["parent-dir"])
+
+    def download_filing_file(
+        self, cik: str, accession_number: str, filename: str, output_dir: Optional[str] = None
+    ) -> str:
+        """
+        Download a specific file from a filing.
+
+        Args:
+            cik: The CIK number
+            accession_number: The accession number of the filing
+            filename: The name of the file to download
+            output_dir: Directory to save the file (default: current directory)
+
+        Returns:
+            Path to the downloaded file
+
+        Raises:
+            EdgarError: If the request fails
+        """
+        normalized_cik = self._normalize_cik(cik)
+        normalized_accession = accession_number.replace("-", "")
+        url = urljoin(self.BASE_URL, f"/Archives/edgar/data/{normalized_cik}/{normalized_accession}/{filename}")
+
+        response = self.get(url)
+
+        if output_dir:
+            os.makedirs(output_dir, exist_ok=True)
+            output_path = os.path.join(output_dir, filename)
+        else:
+            output_path = filename
+
+        with open(output_path, "wb") as f:
+            f.write(response.content)
+
+        return output_path
+
+    def download_filing_files(
+        self,
+        cik: str,
+        accession_number: str,
+        *,
+        extensions: Optional[List[str]] = None,
+        output_dir: Optional[str] = None,
+    ) -> List[str]:
+        """
+        Download all or filtered files from a filing directory.
+
+        Args:
+            cik: The CIK number
+            accession_number: The accession number of the filing
+            extensions: List of file extensions to download (e.g., ['.xml', '.html'])
+            output_dir: Directory to save the files (default: current directory)
+
+        Returns:
+            List of paths to downloaded files
+
+        Raises:
+            EdgarError: If the request fails
+        """
+        directory = self.get_filing_directory(cik, accession_number)
+        downloaded_files = []
+
+        for item in directory.items:
+            if extensions:
+                file_ext = os.path.splitext(item.name)[1].lower()
+                if not any(file_ext.endswith(ext.lower()) for ext in extensions):
+                    continue
+
+            file_path = self.download_filing_file(cik, accession_number, item.name, output_dir)
+            downloaded_files.append(file_path)
+
+        return downloaded_files
 
     @staticmethod
     def _normalize_cik(cik: str) -> str:
