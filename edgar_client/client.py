@@ -101,7 +101,7 @@ class EdgarClient:
 
     @sleep_and_retry
     @limits(calls=10, period=1)
-    def _get(self, url: str) -> Response:
+    def get(self, url: str) -> Response:
         """
         Make a rate-limited GET request.
 
@@ -143,7 +143,7 @@ class EdgarClient:
             EdgarError: If the request fails
         """
         url = urljoin(self.BASE_URL, "/Archives/edgar/cik-lookup-data.txt")
-        response = self._get(url)
+        response = self.get(url)
 
         normalized_ciks = {self._normalize_cik(cik) for cik in (ciks or [])}
 
@@ -200,7 +200,7 @@ class EdgarClient:
             EdgarError: If the request fails
         """
         url = urljoin(self.BASE_URL, "/files/company_tickers_exchange.json")
-        response = self._get(url)
+        response = self.get(url)
         data = response.json()
 
         normalized_ciks = {self._normalize_cik(cik) for cik in (ciks or [])}
@@ -253,7 +253,7 @@ class EdgarClient:
         """
         normalized_cik = self._normalize_cik(cik)
         url = urljoin(self.DATA_URL, f"submissions/CIK{normalized_cik}.json")
-        response = self._get(url)
+        response = self.get(url)
         try:
             return Filer.model_validate(response.json())
         except ValueError as e:
@@ -287,7 +287,7 @@ class EdgarClient:
         """
         normalized_cik = self._normalize_cik(cik)
         url = urljoin(self.DATA_URL, f"submissions/CIK{normalized_cik}.json")
-        response = self._get(url)
+        response = self.get(url)
         data = response.json()
 
         def filing_generator() -> Generator[Filing, None, None]:
@@ -302,7 +302,7 @@ class EdgarClient:
             for file in data["filings"].get("files", []):
                 try:
                     file_url = urljoin(self.DATA_URL, f"submissions/{file['name']}")
-                    file_response = self._get(file_url)
+                    file_response = self.get(file_url)
                     file_data = file_response.json()
 
                     for filing in self._parse_filings(cik, file_data):
